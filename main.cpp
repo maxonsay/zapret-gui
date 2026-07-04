@@ -6,19 +6,24 @@
 #include <shlobj.h>
 #include <algorithm>
 
-// Подключаем библиотеки и управляем подсистемой линкера прямо из кода
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "shell32.lib")
 #pragma comment(linker, "/SUBSYSTEM:WINDOWS")
 
-// Константы идентификаторов элементов управления
+// Идентификаторы элементов управления
 #define IDC_BTN_START           1001
 #define IDC_BTN_SERVICE         1002
 #define IDC_BTN_SET_DIR         1003
 #define IDC_BTN_METHOD_SELECT   1004
 #define IDC_BTN_THEME_SELECT    1005
 #define IDC_CHECK_PIN           1006
-#define IDC_CHECK_AUTORUN        1007
+
+// Новые и измененные идентификаторы для TG и Автозапуска
+#define IDC_BTN_TG_SET_FILE     1008
+#define IDC_BTN_TG_START        1011
+#define IDC_CHECK_AUTORUN_GUI   1012
+#define IDC_CHECK_AUTORUN_ZPR   1013
+#define IDC_CHECK_AUTORUN_TG    1014
 
 #define ID_METHOD_START_RANGE   2000
 #define ID_THEME_LIGHT          3001
@@ -29,39 +34,47 @@
 #define WM_TRAYICON             (WM_USER + 1)
 
 // Глобальные переменные окон
-HWND hTitle, hStaticDir, hBtnSetDir, hBtnMethod, hCheckPin, hCheckAutorun, hBtnStart, hBtnService, hBtnTheme;
+HWND hTitle, hStaticDir, hBtnSetDir, hBtnMethod, hCheckPin, hBtnStart, hBtnService, hBtnTheme;
+HWND hStaticTgFile, hBtnTgSetFile, hBtnTgStart;
+HWND hCheckAutorunGui, hCheckAutorunZpr, hCheckAutorunTg;
+
 HBRUSH hDarkBgBrush = NULL;
 NOTIFYICONDATAW nid = { 0 };
 HANDLE hMutex = NULL;
 
-// Глобальное состояние приложения
+// Глобальное состояние
 bool isDarkTheme = true;
 std::wstring zapretDir = L"";
 std::wstring pinnedMethod = L"";
 std::vector<std::wstring> batFiles;
 int selectedMethodIndex = 0;
 
-// Состояния анимации кастомных кнопок
+// Состояние для TG WS Proxy
+std::wstring tgExePath = L"";
+
+// Анимация кнопок
 bool hBtnStartH = false, hBtnStartP = false;
 bool hBtnServiceH = false, hBtnServiceP = false;
 bool hBtnSetDirH = false, hBtnSetDirP = false;
 bool hBtnMethodH = false, hBtnMethodP = false;
 bool hBtnThemeH = false, hBtnThemeP = false;
+bool hBtnTgSetFileH = false, hBtnTgSetFileP = false;
+bool hBtnTgStartH = false, hBtnTgStartP = false;
 
-// Прототипы функций логики приложения
+// Прототипы
 void SaveConfig();
 void LoadConfig();
 void FindBatFiles();
-void UpdateDirStatusText();
-void RunProcess(const std::wstring& name, bool isService);
-bool IsAutoRunEnabled();
-void SetAutoRun(bool enable);
+void UpdateStatusTexts();
+void RunProcess(const std::wstring& dir, const std::wstring& name, bool asAdmin);
+bool IsAutoRunEnabled(const std::wstring& valueName);
+void SetAutoRun(const std::wstring& valueName, const std::wstring& exePath, bool enable);
 void ApplyImmersiveDarkMode(HWND hwnd, bool dark);
 void AddTrayIcon(HWND hwnd);
 std::wstring BrowseForFolder(HWND hwnd);
+std::wstring BrowseForFile(HWND hwnd);
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
-// Функция получения пути к файлу конфигурации в AppData
 std::wstring GetConfigPath() {
     wchar_t szPath[MAX_PATH];
     if (SUCCEEDED(SHGetFolderPathW(NULL, CSIDL_APPDATA, NULL, 0, szPath))) {
@@ -72,30 +85,29 @@ std::wstring GetConfigPath() {
     return L"config.txt";
 }
 
-// Сохранение конфигурации
 void SaveConfig() {
     std::wofstream file(GetConfigPath());
     if (file.is_open()) {
         file << (isDarkTheme ? 1 : 0) << L"\n";
         file << zapretDir << L"\n";
         file << pinnedMethod << L"\n";
+        file << tgExePath << L"\n";
         file.close();
     }
 }
 
-// Загрузка конфигурации
 void LoadConfig() {
     std::wifstream file(GetConfigPath());
     if (file.is_open()) {
-        std::wstring themeStr, dirStr, pinStr;
+        std::wstring themeStr, dirStr, pinStr, tgPathStr;
         if (std::getline(file, themeStr)) isDarkTheme = (themeStr == L"1");
         if (std::getline(file, dirStr)) zapretDir = dirStr;
         if (std::getline(file, pinStr)) pinnedMethod = pinStr;
+        if (std::getline(file, tgPathStr)) tgExePath = tgPathStr;
         file.close();
     }
 }
 
-// Поиск .bat файлов в выбранной директории
 void FindBatFiles() {
     batFiles.clear();
     selectedMethodIndex = 0;
@@ -108,7 +120,7 @@ void FindBatFiles() {
     if (hFind != INVALID_HANDLE_VALUE) {
         do {
             std::wstring filename = fd.cFileName;
-            if (filename != L"service.bat") {
+            if (filename != L"service.bat" && filename.find(L"service_") == std::wstring::npos) {
                 batFiles.push_back(filename);
             }
         } while (FindNextFileW(hFind, &fd));
@@ -130,41 +142,47 @@ void FindBatFiles() {
     }
 }
 
-// Обновление текста выбранной папки
-void UpdateDirStatusText() {
+void UpdateStatusTexts() {
     if (hStaticDir) {
         if (zapretDir.empty()) {
-            SetWindowTextW(hStaticDir, L"Папка: не указана");
+            SetWindowTextW(hStaticDir, L"Папка Zapret: не указана");
         }
         else {
             std::wstring shortDir = zapretDir;
-            if (shortDir.length() > 35) {
-                shortDir = shortDir.substr(0, 15) + L"..." + shortDir.substr(shortDir.length() - 17);
-            }
-            SetWindowTextW(hStaticDir, (L"Папка: " + shortDir).c_str());
+            if (shortDir.length() > 32) shortDir = shortDir.substr(0, 13) + L"..." + shortDir.substr(shortDir.length() - 16);
+            SetWindowTextW(hStaticDir, (L"Папка Zapret: " + shortDir).c_str());
+        }
+    }
+    if (hStaticTgFile) {
+        if (tgExePath.empty()) {
+            SetWindowTextW(hStaticTgFile, L"Файл TG Proxy: не выбран");
+        }
+        else {
+            std::wstring shortPath = tgExePath;
+            if (shortPath.length() > 32) shortPath = shortPath.substr(0, 13) + L"..." + shortPath.substr(shortPath.length() - 16);
+            SetWindowTextW(hStaticTgFile, (L"Файл TG Proxy: " + shortPath).c_str());
         }
     }
 }
 
-// Запуск выбранного скрипта с правами администратора
-void RunProcess(const std::wstring& name, bool isService) {
-    std::wstring runPath = zapretDir.empty() ? name : zapretDir + L"\\" + name;
+void RunProcess(const std::wstring& dir, const std::wstring& name, bool asAdmin) {
+    if (name.empty()) return;
+    std::wstring runPath = dir.empty() ? name : dir + L"\\" + name;
     SHELLEXECUTEINFOW sei = { sizeof(sei) };
-    sei.lpVerb = L"runas";
+    sei.lpVerb = asAdmin ? L"runas" : L"open";
     sei.lpFile = runPath.c_str();
-    sei.lpDirectory = zapretDir.empty() ? NULL : zapretDir.c_str();
+    sei.lpDirectory = dir.empty() ? NULL : dir.c_str();
     sei.nShow = SW_SHOW;
     ShellExecuteExW(&sei);
 }
 
-// Проверка автозагрузки в реестре
-bool IsAutoRunEnabled() {
+bool IsAutoRunEnabled(const std::wstring& valueName) {
     HKEY hKey;
     bool enabled = false;
     if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Run", 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
         wchar_t path[MAX_PATH];
         DWORD size = sizeof(path);
-        if (RegQueryValueExW(hKey, L"ZapretGUI", NULL, NULL, (LPBYTE)path, &size) == ERROR_SUCCESS) {
+        if (RegQueryValueExW(hKey, valueName.c_str(), NULL, NULL, (LPBYTE)path, &size) == ERROR_SUCCESS) {
             enabled = true;
         }
         RegCloseKey(hKey);
@@ -172,37 +190,30 @@ bool IsAutoRunEnabled() {
     return enabled;
 }
 
-// Установка/удаление автозагрузки
-void SetAutoRun(bool enable) {
+void SetAutoRun(const std::wstring& valueName, const std::wstring& exePath, bool enable) {
     HKEY hKey;
     if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Run", 0, KEY_SET_VALUE, &hKey) == ERROR_SUCCESS) {
-        if (enable) {
-            wchar_t szPath[MAX_PATH];
-            GetModuleFileNameW(NULL, szPath, MAX_PATH);
-            RegSetValueExW(hKey, L"ZapretGUI", 0, REG_SZ, (BYTE*)szPath, (lstrlenW(szPath) + 1) * sizeof(wchar_t));
+        if (enable && !exePath.empty()) {
+            RegSetValueExW(hKey, valueName.c_str(), 0, REG_SZ, (BYTE*)exePath.c_str(), (lstrlenW(exePath.c_str()) + 1) * sizeof(wchar_t));
         }
         else {
-            RegDeleteValueW(hKey, L"ZapretGUI");
+            RegDeleteValueW(hKey, valueName.c_str());
         }
         RegCloseKey(hKey);
     }
 }
 
-// Применение темной темы к заголовку окна (DWM)
 void ApplyImmersiveDarkMode(HWND hwnd, bool dark) {
     BOOL value = dark ? TRUE : FALSE;
     HMODULE hDwm = LoadLibraryW(L"dwmapi.dll");
     if (hDwm) {
         typedef HRESULT(WINAPI* pfnDwmSetWindowAttribute)(HWND, DWORD, LPCVOID, DWORD);
         pfnDwmSetWindowAttribute pDwmSetWindowAttribute = (pfnDwmSetWindowAttribute)GetProcAddress(hDwm, "DwmSetWindowAttribute");
-        if (pDwmSetWindowAttribute) {
-            pDwmSetWindowAttribute(hwnd, 20, &value, sizeof(value));
-        }
+        if (pDwmSetWindowAttribute) pDwmSetWindowAttribute(hwnd, 20, &value, sizeof(value));
         FreeLibrary(hDwm);
     }
 }
 
-// Добавление иконки в системный трей
 void AddTrayIcon(HWND hwnd) {
     nid.cbSize = sizeof(NOTIFYICONDATAW);
     nid.hWnd = hwnd;
@@ -210,11 +221,10 @@ void AddTrayIcon(HWND hwnd) {
     nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     nid.uCallbackMessage = WM_TRAYICON;
     nid.hIcon = LoadIconW(NULL, (LPCWSTR)IDI_APPLICATION);
-    lstrcpyW(nid.szTip, L"Управление Zapret");
+    lstrcpyW(nid.szTip, L"Управление Обходом и TG Proxy");
     Shell_NotifyIconW(NIM_ADD, &nid);
 }
 
-// Диалог выбора папки
 std::wstring BrowseForFolder(HWND hwnd) {
     std::wstring result = L"";
     BROWSEINFOW bi = { 0 };
@@ -224,18 +234,29 @@ std::wstring BrowseForFolder(HWND hwnd) {
     LPITEMIDLIST pidl = SHBrowseForFolderW(&bi);
     if (pidl != NULL) {
         wchar_t path[MAX_PATH];
-        if (SHGetPathFromIDListW(pidl, path)) {
-            result = path;
-        }
+        if (SHGetPathFromIDListW(pidl, path)) result = path;
         CoTaskMemFree(pidl);
     }
     return result;
 }
 
-// Сабкласс для анимации кастомных (OWNERDRAW) кнопок
+std::wstring BrowseForFile(HWND hwnd) {
+    wchar_t szFile[MAX_PATH] = { 0 };
+    OPENFILENAMEW ofn = { 0 };
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = hwnd;
+    ofn.lpstrFilter = L"Исполняемые файлы (*.exe)\0*.exe\0Все файлы (*.*)\0*.*\0";
+    ofn.lpstrFile = szFile;
+    ofn.nMaxFile = sizeof(szFile) / sizeof(wchar_t);
+    ofn.lpstrTitle = L"Выберите исполняемый файл tgwssproxy:";
+    ofn.Flags = OFN_DONTADDTORECENT | OFN_FILEMUSTEXIST;
+
+    if (GetOpenFileNameW(&ofn)) return szFile;
+    return L"";
+}
+
 LRESULT CALLBACK NewButtonSubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam, UINT_PTR uIdSubclass, DWORD_PTR dwRefData) {
-    bool* pHovered = nullptr;
-    bool* pPressed = nullptr;
+    bool* pHovered = nullptr; bool* pPressed = nullptr;
     LONG_PTR id = GetWindowLongPtrW(hwnd, GWLP_ID);
 
     if (id == IDC_BTN_START) { pHovered = &hBtnStartH; pPressed = &hBtnStartP; }
@@ -243,6 +264,8 @@ LRESULT CALLBACK NewButtonSubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
     else if (id == IDC_BTN_SET_DIR) { pHovered = &hBtnSetDirH; pPressed = &hBtnSetDirP; }
     else if (id == IDC_BTN_METHOD_SELECT) { pHovered = &hBtnMethodH; pPressed = &hBtnMethodP; }
     else if (id == IDC_BTN_THEME_SELECT) { pHovered = &hBtnThemeH; pPressed = &hBtnThemeP; }
+    else if (id == IDC_BTN_TG_SET_FILE) { pHovered = &hBtnTgSetFileH; pPressed = &hBtnTgSetFileP; }
+    else if (id == IDC_BTN_TG_START) { pHovered = &hBtnTgStartH; pPressed = &hBtnTgStartP; }
 
     if (pHovered && pPressed) {
         switch (msg) {
@@ -254,44 +277,14 @@ LRESULT CALLBACK NewButtonSubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
                 InvalidateRect(hwnd, NULL, FALSE);
             }
             break;
-        case WM_MOUSELEAVE:
-            *pHovered = false;
-            InvalidateRect(hwnd, NULL, FALSE);
-            break;
-        case WM_LBUTTONDOWN:
-            *pPressed = true;
-            InvalidateRect(hwnd, NULL, FALSE);
-            break;
-        case WM_LBUTTONUP:
-            *pPressed = false;
-            InvalidateRect(hwnd, NULL, FALSE);
-            break;
+        case WM_MOUSELEAVE: *pHovered = false; InvalidateRect(hwnd, NULL, FALSE); break;
+        case WM_LBUTTONDOWN: *pPressed = true; InvalidateRect(hwnd, NULL, FALSE); break;
+        case WM_LBUTTONUP: *pPressed = false; InvalidateRect(hwnd, NULL, FALSE); break;
         }
     }
     return DefSubclassProc(hwnd, msg, wParam, lParam);
 }
 
-// Сабкласс специально для чекбоксов (исправляет клики и цвет текста)
-LRESULT CALLBACK CheckboxSubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam, UINT_PTR uIdSubclass, DWORD_PTR dwRefData) {
-    switch (msg) {
-        // Ловим внутреннюю отрисовку текста чекбокса WinAPI
-    case WM_CTLCOLORSTATIC: {
-        HDC hdc = (HDC)wParam;
-        SetBkMode(hdc, TRANSPARENT);
-        if (isDarkTheme) {
-            SetTextColor(hdc, RGB(220, 220, 220)); // Яркий белый/серый текст для темной темы
-            return (LRESULT)hDarkBgBrush;
-        }
-        else {
-            SetTextColor(hdc, RGB(0, 0, 0)); // Черный текст для светлой темы
-            return (LRESULT)GetSysColorBrush(COLOR_BTNFACE);
-        }
-    }
-    }
-    return DefSubclassProc(hwnd, msg, wParam, lParam);
-}
-
-// Главная оконная процедура
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
     case WM_CREATE: {
@@ -300,44 +293,56 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
         hDarkBgBrush = CreateSolidBrush(RGB(30, 30, 30));
 
-        hTitle = CreateWindowW(L"STATIC", L"Управление Zapret", WS_CHILD | WS_VISIBLE | SS_CENTER, 10, 10, 410, 25, hwnd, NULL, NULL, NULL);
+        hTitle = CreateWindowW(L"STATIC", L"Управление Обходом & Прокси", WS_CHILD | WS_VISIBLE | SS_CENTER, 10, 10, 410, 25, hwnd, NULL, NULL, NULL);
         SendMessageW(hTitle, WM_SETFONT, (WPARAM)CreateFontW(22, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Arial"), TRUE);
 
-        hStaticDir = CreateWindowW(L"STATIC", L"Папка: не указана", WS_CHILD | WS_VISIBLE | SS_LEFT, 20, 45, 290, 20, hwnd, NULL, NULL, NULL);
+        // --- КОНФИГУРАЦИЯ ZAPRET ---
+        hStaticDir = CreateWindowW(L"STATIC", L"Папка Zapret: не указана", WS_CHILD | WS_VISIBLE | SS_LEFT, 20, 50, 290, 20, hwnd, NULL, NULL, NULL);
         SendMessageW(hStaticDir, WM_SETFONT, (WPARAM)hFontSmall, TRUE);
 
-        hBtnSetDir = CreateWindowW(L"BUTTON", L"Обзор...", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 320, 42, 90, 22, hwnd, (HMENU)IDC_BTN_SET_DIR, NULL, NULL);
-        UpdateDirStatusText();
+        hBtnSetDir = CreateWindowW(L"BUTTON", L"Обзор...", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 320, 47, 90, 22, hwnd, (HMENU)IDC_BTN_SET_DIR, NULL, NULL);
+        hBtnMethod = CreateWindowW(L"BUTTON", L"Выбрать метод Zapret...  ▼", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 20, 75, 390, 28, hwnd, (HMENU)IDC_BTN_METHOD_SELECT, NULL, NULL);
 
-        hBtnMethod = CreateWindowW(L"BUTTON", L"Выбрать метод...  ▼", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 20, 75, 390, 28, hwnd, (HMENU)IDC_BTN_METHOD_SELECT, NULL, NULL);
+        hCheckPin = CreateWindowW(L"BUTTON", L"Закрепить выбранный метод", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 20, 110, 390, 20, hwnd, (HMENU)IDC_CHECK_PIN, NULL, NULL);
+        SendMessageW(hCheckPin, WM_SETFONT, (WPARAM)hFont, TRUE);
+
+        hBtnStart = CreateWindowW(L"BUTTON", L"🚀 ЗАПУСТИТЬ МЕТОД ZAPRET", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 20, 135, 390, 38, hwnd, (HMENU)IDC_BTN_START, NULL, NULL);
+        hBtnService = CreateWindowW(L"BUTTON", L"🛠️ Настройка службы Zapret", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 20, 180, 390, 38, hwnd, (HMENU)IDC_BTN_SERVICE, NULL, NULL);
+
+        // --- КОНФИГУРАЦИЯ TG WS PROXY ---
+        hStaticTgFile = CreateWindowW(L"STATIC", L"Файл TG Proxy: не выбран", WS_CHILD | WS_VISIBLE | SS_LEFT, 20, 235, 290, 20, hwnd, NULL, NULL, NULL);
+        SendMessageW(hStaticTgFile, WM_SETFONT, (WPARAM)hFontSmall, TRUE);
+
+        hBtnTgSetFile = CreateWindowW(L"BUTTON", L"Обзор...", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 320, 232, 90, 22, hwnd, (HMENU)IDC_BTN_TG_SET_FILE, NULL, NULL);
+        hBtnTgStart = CreateWindowW(L"BUTTON", L"✈️ ЗАПУСТИТЬ TG WS PROXY", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 20, 260, 390, 38, hwnd, (HMENU)IDC_BTN_TG_START, NULL, NULL);
+
+        // --- РАЗДЕЛЬНЫЙ АВТОЗАПУСК С WINDOWS ---
+        hCheckAutorunGui = CreateWindowW(L"BUTTON", L"Автозапуск этой графической утилиты", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 20, 315, 390, 20, hwnd, (HMENU)IDC_CHECK_AUTORUN_GUI, NULL, NULL);
+        hCheckAutorunZpr = CreateWindowW(L"BUTTON", L"Автозапуск закрепленного батника Zapret", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 20, 340, 390, 20, hwnd, (HMENU)IDC_CHECK_AUTORUN_ZPR, NULL, NULL);
+        hCheckAutorunTg = CreateWindowW(L"BUTTON", L"Автозапуск выбранного TG Proxy (.exe)", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 20, 365, 390, 20, hwnd, (HMENU)IDC_CHECK_AUTORUN_TG, NULL, NULL);
+
+        SendMessageW(hCheckAutorunGui, WM_SETFONT, (WPARAM)hFont, TRUE);
+        SendMessageW(hCheckAutorunZpr, WM_SETFONT, (WPARAM)hFont, TRUE);
+        SendMessageW(hCheckAutorunTg, WM_SETFONT, (WPARAM)hFont, TRUE);
+
+        hBtnTheme = CreateWindowW(L"BUTTON", L"🎨 Смена темы...  ▼", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 20, 400, 140, 25, hwnd, (HMENU)IDC_BTN_THEME_SELECT, NULL, NULL);
+
+        UpdateStatusTexts();
         FindBatFiles();
 
-        // Создаем стандартные чекбоксы
-        hCheckPin = CreateWindowW(L"BUTTON", L"Закрепить этот метод по умолчанию", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 20, 115, 390, 20, hwnd, (HMENU)IDC_CHECK_PIN, NULL, NULL);
-        hCheckAutorun = CreateWindowW(L"BUTTON", L"Запускать вместе с Windows", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 20, 140, 390, 20, hwnd, (HMENU)IDC_CHECK_AUTORUN, NULL, NULL);
+        // Проверка состояний автозагрузки в реестре
+        if (IsAutoRunEnabled(L"ZapretGUI")) SendMessageW(hCheckAutorunGui, BM_SETCHECK, BST_CHECKED, 0);
+        if (IsAutoRunEnabled(L"ZapretGUI_PinnedBat")) SendMessageW(hCheckAutorunZpr, BM_SETCHECK, BST_CHECKED, 0);
+        if (IsAutoRunEnabled(L"ZapretGUI_TgProxy")) SendMessageW(hCheckAutorunTg, BM_SETCHECK, BST_CHECKED, 0);
+        if (!pinnedMethod.empty() && !batFiles.empty()) SendMessageW(hCheckPin, BM_SETCHECK, BST_CHECKED, 0);
 
-        SendMessageW(hCheckPin, WM_SETFONT, (WPARAM)hFont, TRUE);
-        SendMessageW(hCheckAutorun, WM_SETFONT, (WPARAM)hFont, TRUE);
-
-        if (IsAutoRunEnabled()) SendMessageW(hCheckAutorun, BM_SETCHECK, BST_CHECKED, 0);
-        if (!pinnedMethod.empty() && !batFiles.empty()) {
-            SendMessageW(hCheckPin, BM_SETCHECK, BST_CHECKED, 0);
-        }
-
-        hBtnStart = CreateWindowW(L"BUTTON", L"🚀 ЗАПУСТИТЬ ВЫБРАННЫЙ МЕТОД", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 20, 175, 390, 40, hwnd, (HMENU)IDC_BTN_START, NULL, NULL);
-        hBtnService = CreateWindowW(L"BUTTON", L"🛠️ Настройка службы", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 20, 225, 390, 40, hwnd, (HMENU)IDC_BTN_SERVICE, NULL, NULL);
-        hBtnTheme = CreateWindowW(L"BUTTON", L"🎨 Смена темы...  ▼", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 20, 275, 140, 25, hwnd, (HMENU)IDC_BTN_THEME_SELECT, NULL, NULL);
-
-        // Назначаем сабклассы кнопкам
         SetWindowSubclass(hBtnStart, NewButtonSubclassProc, 0, 0);
         SetWindowSubclass(hBtnService, NewButtonSubclassProc, 0, 0);
         SetWindowSubclass(hBtnSetDir, NewButtonSubclassProc, 0, 0);
         SetWindowSubclass(hBtnMethod, NewButtonSubclassProc, 0, 0);
         SetWindowSubclass(hBtnTheme, NewButtonSubclassProc, 0, 0);
-
-        // Назначаем сабклассы чекбоксам для изоляции их контекста отображения
-        SetWindowSubclass(hCheckPin, CheckboxSubclassProc, 1, 0);
-        SetWindowSubclass(hCheckAutorun, CheckboxSubclassProc, 2, 0);
+        SetWindowSubclass(hBtnTgSetFile, NewButtonSubclassProc, 0, 0);
+        SetWindowSubclass(hBtnTgStart, NewButtonSubclassProc, 0, 0);
 
         ApplyImmersiveDarkMode(hwnd, isDarkTheme);
         AddTrayIcon(hwnd);
@@ -369,7 +374,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             else if (pDIS->CtlID == IDC_BTN_SET_DIR) { isHovered = hBtnSetDirH; isPressed = hBtnSetDirP; }
             else if (pDIS->CtlID == IDC_BTN_METHOD_SELECT) { isHovered = hBtnMethodH; isPressed = hBtnMethodP; }
             else if (pDIS->CtlID == IDC_BTN_THEME_SELECT) { isHovered = hBtnThemeH; isPressed = hBtnThemeP; }
-            else { return DefWindowProcW(hwnd, msg, wParam, lParam); } // Пропускаем чекбоксы, их рисует система
+            else if (pDIS->CtlID == IDC_BTN_TG_SET_FILE) { isHovered = hBtnTgSetFileH; isPressed = hBtnTgSetFileP; }
+            else if (pDIS->CtlID == IDC_BTN_TG_START) { isHovered = hBtnTgStartH; isPressed = hBtnTgStartP; }
+            else { return DefWindowProcW(hwnd, msg, wParam, lParam); }
 
             COLORREF bgColor, textColor, borderColor, outerColor;
 
@@ -391,7 +398,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             wchar_t text[128]; GetWindowTextW(pDIS->hwndItem, text, 128);
             SetTextColor(hdc, textColor); SetBkMode(hdc, TRANSPARENT);
 
-            HFONT hBtnFont = CreateFontW((pDIS->CtlID == IDC_BTN_SET_DIR || pDIS->CtlID == IDC_BTN_THEME_SELECT) ? 14 : 16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Arial");
+            HFONT hBtnFont = CreateFontW((pDIS->CtlID == IDC_BTN_SET_DIR || pDIS->CtlID == IDC_BTN_TG_SET_FILE || pDIS->CtlID == IDC_BTN_THEME_SELECT) ? 14 : 16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Arial");
             HGDIOBJ oldFont = SelectObject(hdc, hBtnFont);
 
             DrawTextW(hdc, text, -1, &rect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
@@ -414,20 +421,64 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 UINT flags = MF_STRING | ((int)i == selectedMethodIndex ? MF_CHECKED : MF_UNCHECKED);
                 InsertMenuW(hMethodMenu, (UINT)i, flags, ID_METHOD_START_RANGE + i, batFiles[i].c_str());
             }
-
             RECT rcButton; GetWindowRect(hBtnMethod, &rcButton);
             int trackId = TrackPopupMenu(hMethodMenu, TPM_LEFTALIGN | TPM_TOPALIGN | TPM_RETURNCMD, rcButton.left, rcButton.bottom, 0, hwnd, NULL);
-
             if (trackId >= ID_METHOD_START_RANGE && trackId < ID_METHOD_START_RANGE + (int)batFiles.size()) {
                 selectedMethodIndex = trackId - ID_METHOD_START_RANGE;
                 SetWindowTextW(hBtnMethod, (batFiles[selectedMethodIndex] + L"  ▼").c_str());
-
                 if (SendMessageW(hCheckPin, BM_GETCHECK, 0, 0) == BST_CHECKED) {
                     pinnedMethod = batFiles[selectedMethodIndex];
                     SaveConfig();
                 }
             }
             DestroyMenu(hMethodMenu);
+        }
+        else if (wmId == IDC_BTN_START) {
+            if (!batFiles.empty() && selectedMethodIndex < (int)batFiles.size()) {
+                RunProcess(zapretDir, batFiles[selectedMethodIndex], true);
+            }
+        }
+        else if (wmId == IDC_BTN_TG_START) {
+            if (!tgExePath.empty()) {
+                // Извлекаем директорию и имя из полного пути
+                size_t pos = tgExePath.find_last_of(L"\\/");
+                std::wstring dir = (pos != std::wstring::npos) ? tgExePath.substr(0, pos) : L"";
+                std::wstring name = (pos != std::wstring::npos) ? tgExePath.substr(pos + 1) : tgExePath;
+                RunProcess(dir, name, false); // tgwssproxy обычно не требует админ-прав, запускаем стандартно
+            }
+        }
+        else if (wmId == IDC_BTN_SET_DIR) {
+            std::wstring selected = BrowseForFolder(hwnd);
+            if (!selected.empty()) {
+                zapretDir = selected;
+                SaveConfig(); UpdateStatusTexts(); FindBatFiles();
+                SendMessageW(hCheckPin, BM_SETCHECK, BST_UNCHECKED, 0);
+                InvalidateRect(hwnd, NULL, TRUE);
+            }
+        }
+        else if (wmId == IDC_BTN_TG_SET_FILE) {
+            std::wstring selected = BrowseForFile(hwnd);
+            if (!selected.empty()) {
+                tgExePath = selected;
+                SaveConfig(); UpdateStatusTexts();
+                InvalidateRect(hwnd, NULL, TRUE);
+            }
+        }
+        else if (wmId == IDC_CHECK_PIN) {
+            pinnedMethod = (SendMessageW(hCheckPin, BM_GETCHECK, 0, 0) == BST_CHECKED && !batFiles.empty()) ? batFiles[selectedMethodIndex] : L"";
+            SaveConfig();
+        }
+        // Раздельная логика автозапусков
+        else if (wmId == IDC_CHECK_AUTORUN_GUI) {
+            wchar_t szPath[MAX_PATH]; GetModuleFileNameW(NULL, szPath, MAX_PATH);
+            SetAutoRun(L"ZapretGUI", szPath, SendMessageW(hCheckAutorunGui, BM_GETCHECK, 0, 0) == BST_CHECKED);
+        }
+        else if (wmId == IDC_CHECK_AUTORUN_ZPR) {
+            std::wstring fullBatPath = (zapretDir.empty() || pinnedMethod.empty()) ? L"" : zapretDir + L"\\" + pinnedMethod;
+            SetAutoRun(L"ZapretGUI_PinnedBat", fullBatPath, SendMessageW(hCheckAutorunZpr, BM_GETCHECK, 0, 0) == BST_CHECKED);
+        }
+        else if (wmId == IDC_CHECK_AUTORUN_TG) {
+            SetAutoRun(L"ZapretGUI_TgProxy", tgExePath, SendMessageW(hCheckAutorunTg, BM_GETCHECK, 0, 0) == BST_CHECKED);
         }
         else if (wmId == IDC_BTN_THEME_SELECT) {
             HMENU hThemeMenu = CreatePopupMenu();
@@ -436,7 +487,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
             RECT rcButton; GetWindowRect(hBtnTheme, &rcButton);
             int trackId = TrackPopupMenu(hThemeMenu, TPM_LEFTALIGN | TPM_TOPALIGN | TPM_RETURNCMD, rcButton.left, rcButton.bottom, 0, hwnd, NULL);
-
             if (trackId == ID_THEME_LIGHT || trackId == ID_THEME_DARK) {
                 isDarkTheme = (trackId == ID_THEME_DARK);
                 SaveConfig();
@@ -449,44 +499,14 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             }
             DestroyMenu(hThemeMenu);
         }
-        else if (wmId == IDC_BTN_START) {
-            if (!batFiles.empty() && selectedMethodIndex < (int)batFiles.size()) {
-                RunProcess(batFiles[selectedMethodIndex], false);
-            }
-        }
         else if (wmId == IDC_BTN_SERVICE) {
             std::wstring checkPath = zapretDir.empty() ? L"service.bat" : zapretDir + L"\\service.bat";
             if (GetFileAttributesW(checkPath.c_str()) != INVALID_FILE_ATTRIBUTES) {
-                RunProcess(L"service.bat", true);
+                RunProcess(zapretDir, L"service.bat", true);
             }
             else {
-                MessageBoxW(hwnd, L"Файл service.bat не найден!", L"Ошибка", MB_ICONERROR);
+                MessageBoxW(hwnd, L"Файл service.bat не найден в папке Zapret!", L"Ошибка", MB_ICONERROR);
             }
-        }
-        else if (wmId == IDC_BTN_SET_DIR) {
-            std::wstring selected = BrowseForFolder(hwnd);
-            if (!selected.empty()) {
-                zapretDir = selected;
-                SaveConfig();
-                UpdateDirStatusText();
-                FindBatFiles();
-                SendMessageW(hCheckPin, BM_SETCHECK, BST_UNCHECKED, 0);
-                InvalidateRect(hwnd, NULL, TRUE);
-            }
-        }
-        else if (wmId == IDC_CHECK_PIN) {
-            if (SendMessageW(hCheckPin, BM_GETCHECK, 0, 0) == BST_CHECKED) {
-                if (!batFiles.empty()) pinnedMethod = batFiles[selectedMethodIndex];
-            }
-            else {
-                pinnedMethod = L"";
-            }
-            SaveConfig();
-        }
-        else if (wmId == IDC_CHECK_AUTORUN) {
-            bool isChecked = (SendMessageW(hCheckAutorun, BM_GETCHECK, 0, 0) == BST_CHECKED);
-            SetAutoRun(isChecked);
-            SaveConfig();
         }
         break;
     }
@@ -503,7 +523,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             POINT pt; GetCursorPos(&pt); SetForegroundWindow(hwnd);
             int trackId = TrackPopupMenu(hMenu, TPM_BOTTOMALIGN | TPM_LEFTALIGN | TPM_RETURNCMD, pt.x, pt.y, 0, hwnd, NULL);
             if (trackId == ID_TRAY_SHOW) { ShowWindow(hwnd, SW_SHOW); ShowWindow(hwnd, SW_RESTORE); }
-            else if (trackId == ID_TRAY_EXIT) { DestroyWindow(hwnd); }
+            else if (trackId == ID_TRAY_EXIT) DestroyWindow(hwnd);
             DestroyMenu(hMenu);
         }
         break;
@@ -520,21 +540,17 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     return 0;
 }
 
-// Точка входа приложения
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
     hMutex = CreateMutexW(NULL, TRUE, L"ZapretGUI_Mutex_Unique");
     if (GetLastError() == ERROR_ALREADY_EXISTS) {
-        HWND hWndExisting = FindWindowW(L"ZapretGUIClass", L"Управление Zapret");
+        HWND hWndExisting = FindWindowW(L"ZapretGUIClass", L"Управление Обходом & Прокси");
         if (hWndExisting) {
-            ShowWindow(hWndExisting, SW_SHOW);
-            ShowWindow(hWndExisting, SW_RESTORE);
-            SetForegroundWindow(hWndExisting);
+            ShowWindow(hWndExisting, SW_SHOW); ShowWindow(hWndExisting, SW_RESTORE); SetForegroundWindow(hWndExisting);
         }
         return 0;
     }
 
     CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
-
     LoadConfig();
 
     WNDCLASSW wc = { 0 };
@@ -549,11 +565,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     int screenWidth = GetSystemMetrics(SM_CXSCREEN);
     int screenHeight = GetSystemMetrics(SM_CYSCREEN);
     int windowWidth = 445;
-    int windowHeight = 355;
+    int windowHeight = 480;
     int xPos = (screenWidth - windowWidth) / 2;
     int yPos = (screenHeight - windowHeight) / 2;
 
-    HWND hwnd = CreateWindowExW(0, L"ZapretGUIClass", L"Управление Zapret",
+    HWND hwnd = CreateWindowExW(0, L"ZapretGUIClass", L"Управление Обходом & Прокси",
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
         xPos, yPos, windowWidth, windowHeight, NULL, NULL, hInstance, NULL);
 
